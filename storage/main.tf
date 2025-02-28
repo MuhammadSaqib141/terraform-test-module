@@ -1,6 +1,7 @@
-resource "azurerm_virtual_network" "vnet" {
-  name                = "my-vnet"
-  location            = "East US"
-  resource_group_name = "my-resource-group"
-  address_space       = ["10.0.0.0/16"]
+resource "azurerm_storage_account" "storage" {
+  name                     = "mystorageaccount123"
+  resource_group_name      = "my-resource-group"
+  location                 = "East US"
+  account_tier             = "Standard"
+  account_replication_type = "LRS"
 }
