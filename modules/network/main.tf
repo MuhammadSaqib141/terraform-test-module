@@ -1,11 +1,19 @@
+resource "azurerm_resource_group" "rg" {
+  name     = var.resource_group_name
+  location = var.resource_group_location
+}
+
+
 # -------------------- Virtual Network Creation --------------------
 
 resource "azurerm_virtual_network" "vnet" {
   for_each            = { for vnet in var.virtual_networks : vnet.name => vnet }
   name                = each.value.name
-  resource_group_name = var.resource_group_name
-  location            = each.value.location
+  resource_group_name = azurerm_resource_group.rg.name
+  location            = azurerm_resource_group.rg.location
   address_space       = each.value.address_space
+
+  depends_on = [ azurerm_resource_group.rg ]
 }
 
 # -------------------- Subnet Creation --------------------
@@ -13,7 +21,7 @@ resource "azurerm_virtual_network" "vnet" {
 resource "azurerm_subnet" "subnet" {
   for_each            = { for subnet in var.subnets : subnet.name => subnet }
   name                = each.value.name
-  resource_group_name = var.resource_group_name
+  resource_group_name = azurerm_resource_group.rg.name
   virtual_network_name = each.value.virtual_network_name
   address_prefixes    = each.value.address_prefixes
 
@@ -25,8 +33,8 @@ resource "azurerm_subnet" "subnet" {
 resource "azurerm_network_security_group" "nsg" {
   for_each            = { for nsg in var.nsgs : nsg.name => nsg }
   name                = each.value.name
-  location            = var.resource_group_location
-  resource_group_name = var.resource_group_name
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
 
   dynamic "security_rule" {
     for_each = each.value.rules
