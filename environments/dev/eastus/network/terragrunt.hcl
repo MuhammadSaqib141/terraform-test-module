@@ -14,6 +14,8 @@ locals {
 }
 
 
+
+
 inputs = {
   resource_group_name = "Saqib-RG"
   resource_group_location = local.region
