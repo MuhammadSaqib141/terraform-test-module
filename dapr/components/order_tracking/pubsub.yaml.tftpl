@@ -1,0 +1,28 @@
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: messagebus
+spec:
+  type: pubsub.azure.eventhubs
+  version: v1
+  metadata:
+  - name: connectionString
+    secretKeyRef:
+      name: eventhub-connection-string
+      key: eventhub-connection-string
+  - name: storageAccountName
+    value: "${storage_account_name}"
+  - name: storageAccountKey
+    secretKeyRef:
+      name: eventhub-checkpoints-storage-key
+      key: eventhub-checkpoints-storage-key
+  - name: storageContainerName
+    value: "${storage_container_name}"
+  - name: consumerGroup
+    value: "${consumer_group_name}"
+%{ if length(scopes) > 0 ~}
+scopes:
+%{ for scope in scopes ~}
+  - ${scope}
+%{ endfor ~}
+%{ endif ~}

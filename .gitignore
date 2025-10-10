@@ -1,0 +1,38 @@
+# Local OpenTofu/Terraform files
+**/.terraform/
+**/.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+
+# Crash log files
+crash.log
+
+# Exclude all .tfvars files by default to prevent committing secrets.
+# We will explicitly add back the non-sensitive ones.
+*.tfvars
+
+# IMPORTANT: Explicitly UN-ignore the environment template files
+# because they do not contain secrets.
+!environments/dev.tfvars
+!environments/prod.tfvars
+
+# Plan files can contain sensitive data in plain text
+*.tfplan
+*destroy.tfplan
+
+# Override files
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Local-only diagnostic files
+.terraformrc
+terraform.rc
+
+# Shell script with local variables (if any)
+variables.sh
+
+# IDE / Editor specific files
+.vscode/
+.idea/

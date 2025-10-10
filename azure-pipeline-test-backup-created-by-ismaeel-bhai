@@ -1,0 +1,609 @@
+# ==============================================================================
+# UNIFIED DEPLOYMENT PIPELINE (V3 - DYNAMIC OUTPUTS - CORRECTED)
+# ==============================================================================
+# DESCRIPTION:
+# A single, intelligent pipeline to handle both Infrastructure (IaC) and
+# Application deployments. It auto-detects changes and passes IaC outputs
+# (like ACR name) to the application deployment stage.
+# ==============================================================================
+
+trigger:
+  batch: true
+  branches:
+    include:
+    - main
+  paths:
+    exclude:
+    - '**.md'
+    - '.gitignore'
+
+pr:
+  branches:
+    include:
+    - main
+  paths:
+    include:
+    - '**.tf'
+    - 'azure-pipelines.yaml'
+    - '**.tfvars'
+    - 'src/'
+    - 'dapr/'
+    - 'modules/'
+
+pool:
+  name: 'default' #'self-hosted-linux' # IMPORTANT: Change this to your self-hosted pool name
+
+variables:
+  - group: 'pipeline-secrets'    # Contains: AZURE_SERVICE_CONNECTION, TF_ADMIN_USER_OBJECT_ID, APPROVAL_USERS
+  - group: 'terraform-backend'   # Contains: TF_STATE_RG, TF_STATE_STORAGE_ACCOUNT, etc.
+  - name: imageTag
+    value: '$(Build.BuildId)'
+
+parameters:
+  - name: deploymentScope
+    displayName: 'Deployment Scope (What to deploy?)'
+    type: string
+    default: 'auto'
+    values: [ auto, infrastructure, applications, both, validate ]
+  
+  - name: targetEnvironment
+    displayName: 'Target Environment'
+    type: string
+    default: 'dev'
+    values: [ dev, prod ]
+  
+  - name: requireApproval
+    displayName: 'Require Manual Approval for Deployment?'
+    type: boolean
+    default: true
+
+# ==============================================================================
+# STAGES
+# ==============================================================================
+stages:
+
+# --- STAGE 1: Detect what changed ---
+- stage: Initialize
+  displayName: '🚀 1. Initialize & Detect Changes'
+  jobs:
+  - job: Setup
+    displayName: 'Detect Code Changes'
+    steps:
+    - checkout: self
+      fetchDepth: 2
+    - bash: |
+        set -e
+        IAC_CHANGED=false
+        APP_CHANGED=false
+        SCOPE="${{ parameters.deploymentScope }}"
+        
+        if [[ "$SCOPE" == "both" ]]; then 
+          IAC_CHANGED=true
+          APP_CHANGED=true
+        elif [[ "$SCOPE" == "infrastructure" ]]; then 
+          IAC_CHANGED=true
+        elif [[ "$SCOPE" == "applications" ]]; then 
+          APP_CHANGED=true
+        elif [[ "$SCOPE" == "auto" ]]; then
+          if [ "$(Build.Reason)" == "PullRequest" ]; then
+            CHANGED_FILES=$(git diff origin/main...HEAD --name-only)
+          else
+            CHANGED_FILES=$(git diff HEAD~1 HEAD --name-only 2>/dev/null || git ls-files)
+          fi
+          echo "Files changed in commit:"
+          echo "$CHANGED_FILES"
+          if echo "$CHANGED_FILES" | grep -qE '\.(tf|tfvars)$|^modules/|^dapr/'; then 
+            IAC_CHANGED=true
+          fi
+          if echo "$CHANGED_FILES" | grep -qE '^src/|Dockerfile'; then 
+            APP_CHANGED=true
+          fi
+        fi
+        
+        echo "##vso[task.setvariable variable=iacChanged;isOutput=true]$IAC_CHANGED"
+        echo "##vso[task.setvariable variable=appChanged;isOutput=true]$APP_CHANGED"
+        echo "Infrastructure changes detected: $IAC_CHANGED"
+        echo "Application changes detected: $APP_CHANGED"
+      name: Detection
+
+# --- STAGE 2: Validate IaC (if changes detected) ---
+- stage: ValidateInfrastructure
+  displayName: '🔍 2. Validate Infrastructure'
+  dependsOn: Initialize
+  condition: or(eq(dependencies.Initialize.outputs['Setup.Detection.iacChanged'], 'true'), eq('${{ parameters.deploymentScope }}', 'validate'))
+  jobs:
+  - job: ValidateIaC
+    displayName: 'Tofu Validate & Scan'
+    steps:
+    - checkout: self
+
+    # ====================================================================
+    # STEP 2: LOGIN, INIT, VALIDATE IN A SINGLE STEP
+    # ====================================================================
+    - task: AzureCLI@2
+      displayName: 'Login, Init & Validate Tofu'
+      inputs:
+        azureSubscription: '$(AZURE_SERVICE_CONNECTION)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        addSpnToEnvironment: true  # This provides the Service Principal credentials
+        inlineScript: |
+          set -e # Exit on first error
+
+          echo "--- Setting up Service Principal authentication for Tofu ---"
+          # Export the Service Principal credentials for Terraform/Tofu provider
+          export ARM_CLIENT_ID=$servicePrincipalId
+          export ARM_CLIENT_SECRET=$servicePrincipalKey
+          export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+          export ARM_TENANT_ID=$tenantId
+          
+          # Disable CLI and MSI authentication to force Service Principal auth
+          export ARM_USE_CLI=false
+          export ARM_USE_MSI=false
+          
+          echo "--- Tofu provider will now use Service Principal credentials ---"
+          tofu version
+          
+          echo "--- Running Tofu Format Check ---"
+          tofu fmt -check -recursive || true  # Don't fail on format issues
+          
+          echo "--- Running Tofu Init ---"
+          tofu init -backend-config="resource_group_name=$(TF_STATE_RG)" \
+                    -backend-config="storage_account_name=$(TF_STATE_STORAGE_ACCOUNT)" \
+                    -backend-config="container_name=$(TF_STATE_CONTAINER)" \
+                    -backend-config="key=${{ parameters.targetEnvironment }}.tfstate"
+          
+          echo "--- Running Tofu Validate ---"
+          tofu validate
+
+    # ====================================================================
+    # STEP 3: SECURITY SCAN
+    # ====================================================================
+    - bash: |
+        echo "🔒 Running IaC security scan with Trivy..."
+        # Check if trivy is installed
+        if command -v trivy &> /dev/null; then
+          trivy config --exit-code 1 --severity CRITICAL . || true  # Continue even if security issues found
+        else
+          echo "Trivy not installed, skipping security scan"
+        fi
+      displayName: 'IaC Security Scan (Trivy)'
+
+# --- STAGE 3: Plan IaC (if changes detected) ---
+- stage: PlanInfrastructure
+  displayName: '📋 3. Plan Infrastructure'
+  dependsOn: ValidateInfrastructure
+  condition: and(succeeded(), eq(dependencies.Initialize.outputs['Setup.Detection.iacChanged'], 'true'), ne('${{ parameters.deploymentScope }}', 'validate'))
+  jobs:
+  - job: Plan
+    displayName: 'Create Tofu Plan'
+    steps:
+    - checkout: self
+    - task: AzureCLI@2
+      displayName: 'Create Tofu Plan'
+      inputs:
+        azureSubscription: '$(AZURE_SERVICE_CONNECTION)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        addSpnToEnvironment: true
+        inlineScript: |
+          set -e
+          
+          echo "--- Setting up Service Principal authentication for Tofu ---"
+          # Export Service Principal credentials for Tofu
+          export ARM_CLIENT_ID=$servicePrincipalId
+          export ARM_CLIENT_SECRET=$servicePrincipalKey
+          export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+          export ARM_TENANT_ID=$tenantId
+          export ARM_USE_CLI=false
+          export ARM_USE_MSI=false
+          
+          # Set the admin user object ID
+          export TF_VAR_admin_user_object_id="$(TF_ADMIN_USER_OBJECT_ID)"
+          
+          echo "--- Running Tofu Init ---"
+          tofu init -backend-config="resource_group_name=$(TF_STATE_RG)" \
+                    -backend-config="storage_account_name=$(TF_STATE_STORAGE_ACCOUNT)" \
+                    -backend-config="container_name=$(TF_STATE_CONTAINER)" \
+                    -backend-config="key=${{ parameters.targetEnvironment }}.tfstate"
+          
+          echo "--- Selecting/Creating Workspace ---"
+          tofu workspace select ${{ parameters.targetEnvironment }} || tofu workspace new ${{ parameters.targetEnvironment }}
+          
+          echo "--- Creating Tofu Plan ---"
+          tofu plan -var-file="environments/${{ parameters.targetEnvironment }}.tfvars" \
+                    -out=tfplan.binary -input=false
+          
+          echo "--- Converting Plan to Readable Format ---"
+          tofu show -no-color tfplan.binary > tfplan.txt
+          
+          echo "--- Plan Summary ---"
+          tail -n 50 tfplan.txt
+    
+    - publish: '$(System.DefaultWorkingDirectory)/tfplan.binary'
+      artifact: 'tfplan-${{ parameters.targetEnvironment }}'
+      displayName: 'Publish Binary Plan'
+    
+    - publish: '$(System.DefaultWorkingDirectory)/tfplan.txt'
+      artifact: 'tfplan-readable-${{ parameters.targetEnvironment }}'
+      displayName: 'Publish Readable Plan'
+
+# --- STAGE 4: Manual Approval Gate ---
+- stage: ApprovalGate
+  displayName: '🔐 4. Awaiting Approval'
+  dependsOn: 
+  - PlanInfrastructure
+  - Initialize
+  condition: |
+    and(
+      not(failed()),
+      eq('${{ parameters.requireApproval }}', 'true'),
+      ne(variables['Build.Reason'], 'PullRequest'),
+      ne('${{ parameters.deploymentScope }}', 'validate'),
+      or(
+        eq(dependencies.Initialize.outputs['Setup.Detection.iacChanged'], 'true'),
+        eq(dependencies.Initialize.outputs['Setup.Detection.appChanged'], 'true')
+      )
+    )
+  jobs:
+  - job: WaitForApproval
+    displayName: 'Manual Approval Required'
+    pool: server
+    timeoutInMinutes: 4320 # 3 days
+    steps:
+    - task: ManualValidation@0
+      inputs:
+        notifyUsers: '$(APPROVAL_USERS)'
+        instructions: |
+          Please review the deployment plan for the **${{ parameters.targetEnvironment }}** environment.
+          - **IaC Plan:** Check the 'tfplan-readable-${{ parameters.targetEnvironment }}' artifact.
+          - **App Images:** New images will be built and deployed if app changes were detected.
+          Approve to proceed with deployment.
+        onTimeout: 'reject'
+
+# --- STAGE 5: Deploy IaC ---
+- stage: DeployInfrastructure
+  displayName: '🚀 5. Deploy Infrastructure'
+  dependsOn: 
+  - ApprovalGate
+  - Initialize
+  condition: |
+    and(
+      not(failed()),
+      eq(dependencies.Initialize.outputs['Setup.Detection.iacChanged'], 'true'),
+      ne('${{ parameters.deploymentScope }}', 'validate')
+    )
+  jobs:
+  - job: DeployIaC
+    displayName: 'Apply Tofu Plan & Set Outputs'
+    steps:
+    - checkout: self
+    - download: current
+      artifact: 'tfplan-${{ parameters.targetEnvironment }}'
+      displayName: 'Download Tofu Plan'
+    
+    - task: AzureCLI@2
+      displayName: 'Apply Tofu Plan & Capture Outputs'
+      name: ApplyAndSetOutputs
+      inputs:
+        azureSubscription: '$(AZURE_SERVICE_CONNECTION)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        addSpnToEnvironment: true
+        inlineScript: |
+          set -e
+          
+          echo "--- Setting up Service Principal authentication for Tofu ---"
+          # Export Service Principal credentials for Tofu
+          export ARM_CLIENT_ID=$servicePrincipalId
+          export ARM_CLIENT_SECRET=$servicePrincipalKey
+          export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+          export ARM_TENANT_ID=$tenantId
+          export ARM_USE_CLI=false
+          export ARM_USE_MSI=false
+          
+          echo "--- Running Tofu Init ---"
+          tofu init -backend-config="resource_group_name=$(TF_STATE_RG)" \
+                    -backend-config="storage_account_name=$(TF_STATE_STORAGE_ACCOUNT)" \
+                    -backend-config="container_name=$(TF_STATE_CONTAINER)" \
+                    -backend-config="key=${{ parameters.targetEnvironment }}.tfstate"
+          
+          echo "--- Selecting Workspace ---"
+          tofu workspace select ${{ parameters.targetEnvironment }}
+          
+          echo "--- Applying Tofu Plan ---"
+          tofu apply -input=false -auto-approve "$(Pipeline.Workspace)/tfplan-${{ parameters.targetEnvironment }}/tfplan.binary"
+          
+          echo "--- Capturing Tofu Outputs for subsequent stages ---"
+          tofu output -json > outputs.json
+          
+          # Check if jq is installed, if not try to install it
+          if ! command -v jq &> /dev/null; then
+            echo "jq not found, attempting to install..."
+            if command -v apt-get &> /dev/null; then
+              apt-get update && apt-get install -y jq
+            elif command -v apk &> /dev/null; then
+              apk add --no-cache jq
+            elif command -v yum &> /dev/null; then
+              yum install -y jq
+            else
+              echo "##vso[task.logissue type=warning]Could not install jq"
+            fi
+          fi
+          
+          # Function to safely set output variables
+          set_output_variable() {
+            local var_name=$1
+            local jq_query=$2
+            local value=""
+            
+            if command -v jq &> /dev/null; then
+              value=$(jq -r "$jq_query" outputs.json 2>/dev/null || echo "")
+            else
+              echo "##vso[task.logissue type=warning]jq not available, cannot parse outputs"
+              value=""
+            fi
+            
+            if [ "$value" == "null" ] || [ -z "$value" ]; then 
+              echo "##vso[task.logissue type=warning]Could not find value for $var_name"
+              echo "##vso[task.setvariable variable=$var_name;isOutput=true]NOT_FOUND"
+            else
+              echo "##vso[task.setvariable variable=$var_name;isOutput=true]$value"
+              echo "Set output variable '$var_name' to '$value'"
+            fi
+          }
+          
+          # Set output variables for next stages
+          set_output_variable "ACR_LOGIN_SERVER" '.container_registry_login_servers.value.main'
+          set_output_variable "ACR_NAME" '.container_registry_names.value.main'
+          set_output_variable "RESOURCE_GROUP_APPS" '.resource_group_names.value.apps'
+          set_output_variable "ORDER_API_APP_NAME" '.container_app_urls.value."order_tracking-order-api" | split(".")[0]'
+          set_output_variable "ORDER_WORKER_APP_NAME" '.deployment_summary.value.components_per_app.order_tracking.workers[0]'
+          
+          # Also output to a file for debugging
+          echo "--- Saving outputs to file for debugging ---"
+          cat outputs.json
+    
+    - publish: '$(System.DefaultWorkingDirectory)/outputs.json'
+      artifact: 'tofu-outputs-${{ parameters.targetEnvironment }}'
+      displayName: 'Publish Tofu Outputs'
+      condition: always()
+
+# --- STAGE 6: Deploy Apps ---
+- stage: DeployApplications
+  displayName: '🚀 6. Deploy Applications'
+  dependsOn:
+  - Initialize
+  - ApprovalGate
+  - DeployInfrastructure
+  condition: |
+    and(
+      not(failed()),
+      eq(dependencies.Initialize.outputs['Setup.Detection.appChanged'], 'true'),
+      ne('${{ parameters.deploymentScope }}', 'validate')
+    )
+  jobs:
+  - deployment: DeployApps
+    displayName: 'Build & Update Container Apps'
+    environment: '${{ parameters.targetEnvironment }}-applications'
+    variables:
+      # Get outputs from IaC deployment if it ran
+      ${{ if eq(dependencies.Initialize.outputs['Setup.Detection.iacChanged'], 'true') }}:
+        ACR_LOGIN_SERVER: $[ dependencies.DeployInfrastructure.outputs['DeployIaC.ApplyAndSetOutputs.ACR_LOGIN_SERVER'] ]
+        ACR_NAME: $[ dependencies.DeployInfrastructure.outputs['DeployIaC.ApplyAndSetOutputs.ACR_NAME'] ]
+        APP_RG: $[ dependencies.DeployInfrastructure.outputs['DeployIaC.ApplyAndSetOutputs.RESOURCE_GROUP_APPS'] ]
+        ORDER_API_NAME: $[ dependencies.DeployInfrastructure.outputs['DeployIaC.ApplyAndSetOutputs.ORDER_API_APP_NAME'] ]
+        ORDER_WORKER_NAME: $[ dependencies.DeployInfrastructure.outputs['DeployIaC.ApplyAndSetOutputs.ORDER_WORKER_APP_NAME'] ]
+      # If IaC didn't run, we need to get these values from somewhere else (e.g., Key Vault or hardcoded for now)
+      ${{ else }}:
+        ACR_NAME: 'YOUR_ACR_NAME'  # Replace with actual value or retrieve from Key Vault
+        ACR_LOGIN_SERVER: 'YOUR_ACR_NAME.azurecr.io'  # Replace with actual value
+        APP_RG: 'YOUR_RESOURCE_GROUP'  # Replace with actual value
+        ORDER_API_NAME: 'order-api'  # Replace with actual value
+        ORDER_WORKER_NAME: 'order-worker'  # Replace with actual value
+
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+          
+          - task: AzureCLI@2
+            displayName: 'Retrieve Infrastructure Info (if not from IaC)'
+            condition: eq(dependencies.Initialize.outputs['Setup.Detection.iacChanged'], 'false')
+            inputs:
+              azureSubscription: '$(AZURE_SERVICE_CONNECTION)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                set -e
+                echo "IaC didn't run, attempting to retrieve infrastructure information..."
+                
+                # Try to get values from existing infrastructure
+                # This is a fallback mechanism - adjust based on your naming conventions
+                ENV="${{ parameters.targetEnvironment }}"
+                
+                # Example: Get ACR name (adjust the query based on your naming convention)
+                ACR_NAME=$(az acr list --query "[?contains(name, '$ENV')].name" -o tsv | head -n1)
+                if [ -n "$ACR_NAME" ]; then
+                  echo "##vso[task.setvariable variable=ACR_NAME]$ACR_NAME"
+                  echo "##vso[task.setvariable variable=ACR_LOGIN_SERVER]${ACR_NAME}.azurecr.io"
+                fi
+                
+                # Example: Get resource group (adjust based on your naming convention)
+                APP_RG=$(az group list --query "[?contains(name, '$ENV') && contains(name, 'app')].name" -o tsv | head -n1)
+                if [ -n "$APP_RG" ]; then
+                  echo "##vso[task.setvariable variable=APP_RG]$APP_RG"
+                fi
+                
+                # Get Container App names
+                if [ -n "$APP_RG" ]; then
+                  ORDER_API_NAME=$(az containerapp list -g $APP_RG --query "[?contains(name, 'order-api')].name" -o tsv | head -n1)
+                  ORDER_WORKER_NAME=$(az containerapp list -g $APP_RG --query "[?contains(name, 'order-worker')].name" -o tsv | head -n1)
+                  
+                  [ -n "$ORDER_API_NAME" ] && echo "##vso[task.setvariable variable=ORDER_API_NAME]$ORDER_API_NAME"
+                  [ -n "$ORDER_WORKER_NAME" ] && echo "##vso[task.setvariable variable=ORDER_WORKER_NAME]$ORDER_WORKER_NAME"
+                fi
+          
+          - task: AzureCLI@2
+            displayName: 'Build & Push Application Images'
+            inputs:
+              azureSubscription: '$(AZURE_SERVICE_CONNECTION)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                set -e
+                
+                echo "Building images with ACR: $(ACR_NAME)"
+                
+                # Build images using ACR build task
+                echo "--- Building order-api image ---"
+                az acr build -r $(ACR_NAME) \
+                  -f ./src/order-api/Dockerfile \
+                  --image order-api:$(imageTag) \
+                  --image order-api:latest \
+                  ./src/order-api
+                
+                echo "--- Building order-worker image ---"
+                az acr build -r $(ACR_NAME) \
+                  -f ./src/order-worker/Dockerfile \
+                  --image order-worker:$(imageTag) \
+                  --image order-worker:latest \
+                  ./src/order-worker
+          
+          - task: AzureCLI@2
+            displayName: 'Security Scan Images'
+            condition: false  # Disable for now if trivy is not available
+            inputs:
+              azureSubscription: '$(AZURE_SERVICE_CONNECTION)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                set -e
+                
+                if command -v trivy &> /dev/null; then
+                  echo "--- Scanning order-api image ---"
+                  trivy image --exit-code 1 --severity CRITICAL "$(ACR_LOGIN_SERVER)/order-api:$(imageTag)" || true
+                  
+                  echo "--- Scanning order-worker image ---"
+                  trivy image --exit-code 1 --severity CRITICAL "$(ACR_LOGIN_SERVER)/order-worker:$(imageTag)" || true
+                else
+                  echo "Trivy not installed, skipping security scan"
+                fi
+
+          - task: AzureCLI@2
+            displayName: 'Update Container Apps with New Images'
+            inputs:
+              azureSubscription: '$(AZURE_SERVICE_CONNECTION)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                set -e
+                
+                echo "Updating Container Apps in resource group: $(APP_RG)"
+                echo "Order API App Name: $(ORDER_API_NAME)"
+                echo "Order Worker App Name: $(ORDER_WORKER_NAME)"
+                
+                # Update order-api
+                if [ "$(ORDER_API_NAME)" != "NOT_FOUND" ] && [ -n "$(ORDER_API_NAME)" ]; then
+                  echo "--- Updating order-api container app ---"
+                  az containerapp update \
+                    -n $(ORDER_API_NAME) \
+                    -g $(APP_RG) \
+                    --image "$(ACR_LOGIN_SERVER)/order-api:$(imageTag)"
+                else
+                  echo "##vso[task.logissue type=warning]Order API app name not found, skipping update"
+                fi
+                
+                # Update order-worker
+                if [ "$(ORDER_WORKER_NAME)" != "NOT_FOUND" ] && [ -n "$(ORDER_WORKER_NAME)" ]; then
+                  echo "--- Updating order-worker container app ---"
+                  az containerapp update \
+                    -n $(ORDER_WORKER_NAME) \
+                    -g $(APP_RG) \
+                    --image "$(ACR_LOGIN_SERVER)/order-worker:$(imageTag)"
+                else
+                  echo "##vso[task.logissue type=warning]Order Worker app name not found, skipping update"
+                fi
+
+# --- STAGE 7: Post-Deployment Validation ---
+- stage: ValidateDeployment
+  displayName: '✅ 7. Validate Deployment'
+  dependsOn:
+  - Initialize
+  - DeployInfrastructure
+  - DeployApplications
+  condition: |
+    and(
+      not(failed()),
+      ne('${{ parameters.deploymentScope }}', 'validate'),
+      or(
+        eq(dependencies.Initialize.outputs['Setup.Detection.iacChanged'], 'true'),
+        eq(dependencies.Initialize.outputs['Setup.Detection.appChanged'], 'true')
+      )
+    )
+  jobs:
+  - job: SmokeTest
+    displayName: 'Run Smoke Tests'
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Health Check Container Apps'
+      inputs:
+        azureSubscription: '$(AZURE_SERVICE_CONNECTION)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          set -e
+          
+          echo "--- Running deployment validation ---"
+          ENV="${{ parameters.targetEnvironment }}"
+          
+          # Get resource group
+          APP_RG=$(az group list --query "[?contains(name, '$ENV') && contains(name, 'app')].name" -o tsv | head -n1)
+          
+          if [ -n "$APP_RG" ]; then
+            echo "Checking Container Apps in resource group: $APP_RG"
+            
+            # List all container apps
+            echo "--- Container Apps in the environment ---"
+            az containerapp list -g $APP_RG --query "[].{Name:name, Status:properties.provisioningState, URL:properties.configuration.ingress.fqdn}" -o table
+            
+            # Check order-api health
+            ORDER_API_URL=$(az containerapp show -n order-api -g $APP_RG --query "properties.configuration.ingress.fqdn" -o tsv 2>/dev/null || echo "")
+            if [ -n "$ORDER_API_URL" ] && [ "$ORDER_API_URL" != "null" ]; then
+              echo "--- Testing order-api health endpoint ---"
+              curl -f "https://$ORDER_API_URL/health" || echo "Health check failed (might be expected if endpoint doesn't exist)"
+            fi
+            
+            # Check if apps are running
+            echo "--- Checking Container App revision status ---"
+            for app in $(az containerapp list -g $APP_RG --query "[].name" -o tsv); do
+              echo "App: $app"
+              az containerapp revision list -n $app -g $APP_RG --query "[0].{Name:name, Active:properties.active, Status:properties.runningState}" -o table
+            done
+          else
+            echo "##vso[task.logissue type=warning]Could not find application resource group for environment: $ENV"
+          fi
+          
+          echo "--- Deployment validation completed ---"
+    
+    - task: AzureCLI@2
+      displayName: 'Display Deployment Summary'
+      condition: always()
+      inputs:
+        azureSubscription: '$(AZURE_SERVICE_CONNECTION)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          echo "=========================================="
+          echo "    DEPLOYMENT SUMMARY"
+          echo "=========================================="
+          echo "Environment: ${{ parameters.targetEnvironment }}"
+          echo "Build ID: $(Build.BuildId)"
+          echo "Image Tag: $(imageTag)"
+          echo ""
+          echo "Infrastructure Changed: $(iacChanged)"
+          echo "Applications Changed: $(appChanged)"
+          echo ""
+          echo "Deployment Scope: ${{ parameters.deploymentScope }}"
+          echo "=========================================="

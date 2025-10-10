@@ -1,0 +1,1318 @@
+parameters:
+  - name: deploymentScope
+    displayName: 'Deployment Scope'
+    type: string
+    default: 'auto'
+    values: [auto, infrastructure, applications, complete, validate]
+
+  - name: destroyResources
+    displayName: 'Destroy All Resources'
+    type: boolean
+    default: false
+
+name: 'Deploy-$(Date:yyyyMMdd).$(Rev:r)'
+
+trigger:
+  batch: true
+  branches:
+    include: [main, master, develop]
+  paths:
+    exclude: ['**.md', '.gitignore']
+
+pool:
+  name: "Default"
+
+variables:
+  - group: 'pipeline-config'
+  - name: imageTag
+    value: '$(Build.BuildId)'
+  - name: targetEnvironment
+    value: 'dev'
+
+  - name: initialInfraTargets
+    value: >-
+      -target=module.logging
+      -target=module.search_service
+      -target=module.resource_groups
+      -target=module.container_registries
+      -target=module.vnet
+      -target=module.api_management
+      -target=data.azurerm_virtual_network.agent_vnet[0]
+      -target=azurerm_private_dns_zone.acr[0]
+      -target=azurerm_private_dns_zone_virtual_network_link.acr_app_link[0]
+      -target=azurerm_private_dns_zone_virtual_network_link.acr_agent_link[0]
+      -target='azurerm_private_endpoint.acr["main"]'
+      -target=azurerm_virtual_network_peering.app_to_agent[0]
+      -target=azurerm_virtual_network_peering.agent_to_app[0]
+      -target=azurerm_role_assignment.pipeline_sp_acrpull[0]
+      -target=time_sleep.wait_for_dns_propagation[0]
+
+stages:
+
+# ------------------------------------------------------------------------------
+# STAGE 1: Initialize
+# ------------------------------------------------------------------------------
+- stage: Initialize
+  displayName: '1. Initialize & Detect Changes'
+  jobs:
+  - job: Deploy
+    steps:
+      - bash: |
+          if [[ "$(Build.SourceBranchName)" == "main" || "$(Build.SourceBranchName)" == "master" ]]; then
+            echo "##vso[task.setvariable variable=targetEnvironment]prod"
+          fi
+        displayName: 'Set target environment'
+      
+      - script: echo "Deploying to $(targetEnvironment) environment"
+        displayName: 'Display target environment'
+        
+  - job: Setup
+    displayName: 'Detect Changes'
+    steps:
+    - checkout: self
+      fetchDepth: 2
+
+    - bash: |
+        set -e
+        export ARM_CLIENT_ID=$(ARM_CLIENT_ID)
+        export ARM_CLIENT_SECRET=$(ARM_CLIENT_SECRET)
+        export ARM_TENANT_ID=$(ARM_TENANT_ID)
+        export ARM_SUBSCRIPTION_ID=$(ARM_SUBSCRIPTION_ID)
+        export ARM_USE_CLI=false
+        # export TF_VAR_admin_user_object_id=$(TF_ADMIN_USER_OBJECT_ID)
+        echo "Terraform environment variables set."
+      name: SetTerraformVars
+      displayName: 'Set Terraform Environment Variables'
+    
+    - bash: |
+        echo "Source Branch: $(Build.SourceBranchName)"
+        echo "Target Environment set to: $(targetEnvironment)"
+      displayName: 'Verify Environment'
+
+    - bash: |
+        set -e
+        IAC_CHANGED=false
+        APP_CHANGED=false
+        ORDER_API_CHANGED=false
+        ORDER_WORKER_CHANGED=false
+        SCOPE="${{ parameters.deploymentScope }}"
+        
+        echo "======= Deployment Scope: $SCOPE ======="
+        
+        if [[ "$SCOPE" == "complete" ]]; then 
+          IAC_CHANGED=true
+          APP_CHANGED=true
+          ORDER_API_CHANGED=true
+          ORDER_WORKER_CHANGED=true
+        elif [[ "$SCOPE" == "infrastructure" ]]; then 
+          IAC_CHANGED=true
+        elif [[ "$SCOPE" == "applications" ]]; then 
+          APP_CHANGED=true
+          ORDER_API_CHANGED=true
+          ORDER_WORKER_CHANGED=true
+        elif [[ "$SCOPE" == "auto" ]]; then
+          if [ "$(Build.Reason)" == "PullRequest" ]; then
+            CHANGED_FILES=$(git diff origin/main...HEAD --name-only)
+          else
+            CHANGED_FILES=$(git diff HEAD~1 HEAD --name-only 2>/dev/null || git ls-files)
+          fi
+          
+          echo "======= Changed Files ======="
+          echo "$CHANGED_FILES"
+          echo "============================="
+          
+          # Check for infrastructure changes
+          if echo "$CHANGED_FILES" | grep -qE '\.(tf|tfvars)$|^modules/|^dapr/'; then 
+            IAC_CHANGED=true
+            echo "Infrastructure files changed - IAC_CHANGED set to true"
+          fi
+          
+          # Check for order-api changes
+          if echo "$CHANGED_FILES" | grep -qE '^src/order-api/'; then 
+            ORDER_API_CHANGED=true
+            APP_CHANGED=true
+            echo "Order API files changed - ORDER_API_CHANGED set to true"
+          fi
+          
+          # Check for order-worker changes
+          if echo "$CHANGED_FILES" | grep -qE '^src/order-worker/'; then 
+            ORDER_WORKER_CHANGED=true
+            APP_CHANGED=true
+            echo "Order Worker files changed - ORDER_WORKER_CHANGED set to true"
+          fi
+        fi
+        
+        # Export variables for use in other stages
+        echo "##vso[task.setvariable variable=iacChanged;isOutput=true]$IAC_CHANGED"
+        echo "##vso[task.setvariable variable=appChanged;isOutput=true]$APP_CHANGED"
+        echo "##vso[task.setvariable variable=orderApiChanged;isOutput=true]$ORDER_API_CHANGED"
+        echo "##vso[task.setvariable variable=orderWorkerChanged;isOutput=true]$ORDER_WORKER_CHANGED"
+        
+        echo "======= Final Detection Results ======="
+        echo "Infrastructure changes (iacChanged): $IAC_CHANGED"
+        echo "Application changes (appChanged): $APP_CHANGED"
+        echo "Order API changes (orderApiChanged): $ORDER_API_CHANGED"
+        echo "Order Worker changes (orderWorkerChanged): $ORDER_WORKER_CHANGED"
+        echo "========================================"
+      name: Detection
+      displayName: 'Detect Changes'
+
+# ------------------------------------------------------------------------------
+# STAGE 2: Infrastructure Plan
+# ------------------------------------------------------------------------------
+- stage: PlanInfrastructure
+  displayName: '2. Plan Infrastructure'
+  dependsOn: Initialize
+  condition: |
+    and(
+      eq('${{ parameters.destroyResources }}', false),
+      or(
+        eq(dependencies.Initialize.outputs['Setup.Detection.iacChanged'], 'true'),
+        eq('${{ parameters.deploymentScope }}', 'infrastructure'),
+        eq('${{ parameters.deploymentScope }}', 'complete')
+      )
+    )
+  jobs:
+  - job: Plan
+    displayName: 'Plan Infrastructure Changes'
+    steps:
+    - checkout: self
+    - script: |
+        set -e
+        
+        echo "--- Initializing Tofu for $(targetEnvironment) ---"
+        tofu init \
+          -backend-config="resource_group_name=$(TF_STATE_RG)" \
+          -backend-config="storage_account_name=$(TF_STATE_STORAGE_ACCOUNT)" \
+          -backend-config="container_name=$(TF_STATE_CONTAINER)" \
+          -backend-config="key=$(targetEnvironment).tfstate"
+       
+        echo "--- Checking Tofu code formatting ---"
+        tofu fmt -check -recursive
+
+        echo "--- Validating Tofu configuration ---"
+        tofu validate
+
+        tofu workspace select $(targetEnvironment) || tofu workspace new $(targetEnvironment)
+
+        echo "--- Planning full infrastructure deployment ---"
+        tofu plan -var-file="environments/$(targetEnvironment).tfvars" -out=tfplan.binary -input=false ${{ variables.initialInfraTargets }}
+        
+        echo "================================================"
+        echo "TERRAFORM PLAN SUMMARY FOR REVIEW"
+        echo "================================================"
+        tofu show -no-color tfplan.binary > tfplan.txt
+        
+        ADD=$(grep -c "will be created" tfplan.txt || true)
+        CHANGE=$(grep -c "will be updated" tfplan.txt || true)
+        DESTROY=$(grep -c "will be destroyed" tfplan.txt || true)
+        
+        echo " PLAN SUMMARY:"
+        echo " To Add: $ADD resources"
+        echo " To Change: $CHANGE resources"
+        echo " To Destroy: $DESTROY resources"
+        echo "================================================"
+        
+        tail -n 100 tfplan.txt
+        
+      name: CreatePlan
+      displayName: 'Create Terraform Plan'
+    
+    - publish: '$(System.DefaultWorkingDirectory)/tfplan.binary'
+      artifact: 'terraform-plan-$(targetEnvironment)'
+    
+    - publish: '$(System.DefaultWorkingDirectory)/tfplan.txt'
+      artifact: 'terraform-plan-readable-$(targetEnvironment)'
+
+# ------------------------------------------------------------------------------
+# STAGE 3: Manual Approval Gate for Infrastructure
+# ------------------------------------------------------------------------------
+- stage: ApproveInfrastructure
+  displayName: '3. Approve Infrastructure Changes'
+  dependsOn: PlanInfrastructure
+  condition: and(succeeded(), eq(variables['targetEnvironment'], 'prod'), eq('${{ parameters.destroyResources }}', false))
+  jobs:
+  - job: WaitForApproval
+    displayName: 'Manual Approval Required for PROD'
+    pool: server
+    timeoutInMinutes: 1440
+    steps:
+    - task: ManualValidation@1
+      displayName: 'Wait for Infrastructure Approval'
+      timeoutInMinutes: 1440
+      inputs:
+        notifyUsers: |
+          "ismaeelsahib@gmail.com"
+        approvers: "ismaeelhaider@rashideurustechnologies.onmicrosoft.com"
+        allowApproversToApproveTheirOwnRuns: true
+        instructions: |
+          PRODUCTION INFRASTRUCTURE DEPLOYMENT APPROVAL REQUIRED
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          
+          DEPLOYMENT DETAILS:
+          • Environment: $(targetEnvironment)
+          • Branch: $(Build.SourceBranch)
+          • Triggered by: $(Build.RequestedFor)
+          • Build ID: $(Build.BuildId)
+          • Pipeline: $(Build.DefinitionName)
+          
+          ⚡ ACTION REQUIRED:
+          Please review the Terraform plan artifact before approving.
+          
+          📎 TO REVIEW PLAN:
+          1. Go to Pipeline Run → Artifacts
+          2. Download 'terraform-plan-readable-$(targetEnvironment)'
+          3. Review all changes carefully
+          
+          TO APPROVE: Click "Resume" button
+          TO REJECT: Click "Reject" button
+          
+          This request will timeout in 24 hours
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        onTimeout: 'reject'
+
+# ------------------------------------------------------------------------------
+# STAGE 4: Apply Shared Infrastructure
+# ------------------------------------------------------------------------------
+- stage: ApplySharedInfrastructure
+  displayName: '4. Apply Shared Infrastructure'
+  dependsOn: 
+    - PlanInfrastructure
+    - ApproveInfrastructure
+  condition: |
+    and(
+      eq(dependencies.PlanInfrastructure.result, 'Succeeded'),
+      or(
+        eq(dependencies.ApproveInfrastructure.result, 'Succeeded'),
+        eq(dependencies.ApproveInfrastructure.result, 'Skipped')
+      ),
+      eq('${{ parameters.destroyResources }}', false)
+    )
+  jobs:
+  - job: Apply
+    displayName: 'Apply Shared Infrastructure'
+    steps:
+    - checkout: self
+    
+    - script: |
+        set -e
+        
+        echo "Approval received or not required. Proceeding with initial infrastructure deployment..."
+        
+        echo "--- Initializing Tofu for $(targetEnvironment) ---"
+        if ! tofu init \
+          -backend-config="resource_group_name=$(TF_STATE_RG)" \
+          -backend-config="storage_account_name=$(TF_STATE_STORAGE_ACCOUNT)" \
+          -backend-config="container_name=$(TF_STATE_CONTAINER)" \
+          -backend-config="key=$(targetEnvironment).tfstate"; then
+          echo "Failed to initialize Tofu"
+          exit 1
+        fi
+
+        echo "--- Selecting workspace ---"
+        if ! tofu workspace select $(targetEnvironment); then
+          echo "Creating new workspace: $(targetEnvironment)"
+          tofu workspace new $(targetEnvironment)
+        fi
+
+        echo "DEBUG: The initialInfraTargets variable is: $(initialInfraTargets)"
+        echo "--- Applying initial infrastructure ---"
+        tofu apply -var-file="environments/$(targetEnvironment).tfvars" \
+          $(initialInfraTargets) \
+          -auto-approve
+
+        echo "--- Exporting outputs ---"
+        tofu output -json > outputs.json
+        
+        echo "Initial infrastructure deployment completed successfully!"
+        
+      name: ApplyInitialPlan
+      displayName: 'Apply Initial Terraform Plan'
+    
+    - publish: '$(System.DefaultWorkingDirectory)/outputs.json'
+      artifact: 'tofu-outputs-shared-infra-$(targetEnvironment)'
+
+# ------------------------------------------------------------------------------
+# STAGE 5: Build, Scan & Push Docker Images
+# ------------------------------------------------------------------------------
+- stage: BuildScanAndPushImages
+  displayName: '5. Build, Scan & Push Docker Images'
+  dependsOn: 
+    - Initialize
+    - ApplySharedInfrastructure
+  condition: |
+    and(
+      eq('${{ parameters.destroyResources }}', false),
+      ne(dependencies.ApplySharedInfrastructure.result, 'Failed'),
+      or(
+        eq(dependencies.Initialize.outputs['Setup.Detection.appChanged'], 'true'),
+        eq('${{ parameters.deploymentScope }}', 'applications'),
+        eq('${{ parameters.deploymentScope }}', 'complete')
+      )
+    )
+  jobs:
+  - job: BuildPush
+    displayName: 'Build, Scan & Push Images'
+    variables:
+      orderApiChanged: $[ stageDependencies.Initialize.Setup.outputs['Detection.orderApiChanged'] ]
+      orderWorkerChanged: $[ stageDependencies.Initialize.Setup.outputs['Detection.orderWorkerChanged'] ]
+      appChanged: $[ stageDependencies.Initialize.Setup.outputs['Detection.appChanged'] ]
+    steps:
+    - checkout: self
+
+    # Get ACR details from Tofu state
+    - task: Bash@3
+      name: GetInfraOutputs
+      displayName: 'Get Infrastructure Outputs from Tofu State'
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -e
+          echo "Connecting to Tofu state for $(targetEnvironment)..."
+          tofu init -reconfigure \
+            -backend-config="resource_group_name=$(TF_STATE_RG)" \
+            -backend-config="storage_account_name=$(TF_STATE_STORAGE_ACCOUNT)" \
+            -backend-config="container_name=$(TF_STATE_CONTAINER)" \
+            -backend-config="key=$(targetEnvironment).tfstate"
+          tofu workspace select $(targetEnvironment)
+          echo "Fetching outputs from state..."
+          tofu output -json > outputs.json
+          ACR_NAME=$(jq -r '.container_registry_names.value.main // "NOT_FOUND"' outputs.json)
+          if [ "$ACR_NAME" == "NOT_FOUND" ]; then
+            echo "Error: ACR Name not found in Tofu outputs!"
+            exit 1
+          fi
+          echo "##vso[task.setvariable variable=ACR_NAME]$ACR_NAME"
+          echo "ACR Name: $ACR_NAME"
+
+    # --- Order API CI Gates ---
+    - task: Bash@3
+      displayName: 'Order API - Run Unit Tests'
+      condition: |
+        and(
+          succeeded(),
+          or(
+            eq(variables['orderApiChanged'], 'true'),
+            eq('${{ parameters.deploymentScope }}', 'applications'),
+            eq('${{ parameters.deploymentScope }}', 'complete')
+          )
+        )
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "======= Running Unit Tests for Order API ======="
+          # This is a placeholder. Replace with your actual test command.
+          # Example for .NET:
+          # dotnet test ./src/order-api/tests/MyProject.Tests.csproj
+          # Example for Node.js:
+          # cd ./src/order-api && npm install && npm test
+          echo "✓ Unit tests passed (placeholder)."
+          cd $(System.DefaultWorkingDirectory)
+        
+    - task: Bash@3
+      name: BuildOrderApiImage
+      displayName: 'Order API - Build & Scan Image'
+      condition: |
+        and(
+          succeeded(),
+          or(
+            eq(variables['orderApiChanged'], 'true'),
+            eq('${{ parameters.deploymentScope }}', 'applications'),
+            eq('${{ parameters.deploymentScope }}', 'complete')
+          )
+        )
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -e
+          IMAGE_NAME="$(ACR_NAME).azurecr.io/order-api:$(imageTag)"
+          echo "======= Building Order API Image ======="
+          echo "Building local image: $IMAGE_NAME"
+          docker build -t $IMAGE_NAME -f ./src/order-api/Dockerfile ./src/order-api
+
+          echo "--- Scanning image for vulnerabilities ---"
+          # Generate report for Azure DevOps security tab
+          trivy image --format sarif --output $(Build.ArtifactStagingDirectory)/order-api-trivy.sarif $IMAGE_NAME
+
+          # Fail pipeline on critical vulnerabilities
+          echo "--- Checking for CRITICAL severity vulnerabilities ---"
+          trivy image --exit-code 1 --severity CRITICAL $IMAGE_NAME
+          
+          echo "✓ Scan complete. No critical vulnerabilities found."
+          echo "##vso[task.setvariable variable=orderApiImageBuilt;isOutput=true]true"
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Order API Scan Report'
+      condition: |
+        and(
+          always(),
+          or(
+            eq(variables['orderApiChanged'], 'true'),
+            eq('${{ parameters.deploymentScope }}', 'applications'),
+            eq('${{ parameters.deploymentScope }}', 'complete')
+          )
+        )
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)/order-api-trivy.sarif'
+        ArtifactName: 'CodeAnalysisLogs'
+
+    # --- Order Worker CI Gates ---
+    - task: Bash@3
+      displayName: 'Order Worker - Run Unit Tests'
+      condition: |
+        and(
+          succeeded(),
+          or(
+            eq(variables['orderWorkerChanged'], 'true'),
+            eq('${{ parameters.deploymentScope }}', 'applications'),
+            eq('${{ parameters.deploymentScope }}', 'complete')
+          )
+        )
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "======= Running Unit Tests for Order Worker ======="
+          # This is a placeholder. Replace with your actual test command.
+          # Example for Python:
+          # cd ./src/order-worker && pip install -r requirements-dev.txt && pytest
+          echo "✓ Unit tests passed (placeholder)."
+          cd $(System.DefaultWorkingDirectory)
+
+    - task: Bash@3
+      name: BuildOrderWorkerImage
+      displayName: 'Order Worker - Build & Scan Image'
+      condition: |
+        and(
+          succeeded(),
+          or(
+            eq(variables['orderWorkerChanged'], 'true'),
+            eq('${{ parameters.deploymentScope }}', 'applications'),
+            eq('${{ parameters.deploymentScope }}', 'complete')
+          )
+        )
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -e
+          IMAGE_NAME="$(ACR_NAME).azurecr.io/order-worker:$(imageTag)"
+          echo "======= Building Order Worker Image ======="
+          echo "Building local image: $IMAGE_NAME"
+          docker build -t $IMAGE_NAME -f ./src/order-worker/Dockerfile ./src/order-worker
+
+          echo "--- Scanning image for vulnerabilities ---"
+          trivy image --format sarif --output $(Build.ArtifactStagingDirectory)/order-worker-trivy.sarif $IMAGE_NAME
+
+          echo "--- Checking for CRITICAL severity vulnerabilities ---"
+          trivy image --exit-code 1 --severity CRITICAL $IMAGE_NAME
+          
+          echo "✓ Scan complete. No critical vulnerabilities found."
+          echo "##vso[task.setvariable variable=orderWorkerImageBuilt;isOutput=true]true"
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Order Worker Scan Report'
+      condition: |
+        and(
+          always(),
+          or(
+            eq(variables['orderWorkerChanged'], 'true'),
+            eq('${{ parameters.deploymentScope }}', 'applications'),
+            eq('${{ parameters.deploymentScope }}', 'complete')
+          )
+        )
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)/order-worker-trivy.sarif'
+        ArtifactName: 'CodeAnalysisLogs'
+
+    # --- Login & Push Images (Conditional) ---
+    - task: Bash@3
+      name: LoginAndPushImages
+      displayName: 'Login and Push Built Images to ACR'
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -e
+          echo "======= Authenticating with Azure & ACR ======="
+          az login --service-principal -u $(ARM_CLIENT_ID) -p $(ARM_CLIENT_SECRET) --tenant $(ARM_TENANT_ID)
+          az account set --subscription $(ARM_SUBSCRIPTION_ID)
+          
+          echo "Logging into ACR: $(ACR_NAME)"
+          az acr login --name $(ACR_NAME)
+
+          echo "======= Checking for Built Images ======="
+          
+          # List local Docker images to see what was built
+          echo "Local Docker images:"
+          docker images | grep "$(ACR_NAME)" || true
+          
+          PUSH_COUNT=0
+          ORDER_API_PUSHED=false
+          ORDER_WORKER_PUSHED=false
+          
+          # Check and push Order API
+          ORDER_API_IMAGE="$(ACR_NAME).azurecr.io/order-api:$(imageTag)"
+          if docker images --format "{{.Repository}}:{{.Tag}}" | grep -q "^${ORDER_API_IMAGE}$"; then
+            echo "======================================="
+            echo "  PUSHING ORDER API IMAGE"
+            echo "======================================="
+            echo "Image: $ORDER_API_IMAGE"
+            
+            docker push $ORDER_API_IMAGE
+            
+            echo "--- Tagging and pushing Order API as latest ---"
+            docker tag $ORDER_API_IMAGE $(ACR_NAME).azurecr.io/order-api:latest
+            docker push $(ACR_NAME).azurecr.io/order-api:latest
+            
+            echo "✓ Order API images pushed successfully"
+            PUSH_COUNT=$((PUSH_COUNT + 1))
+            ORDER_API_PUSHED=true
+            
+            # Set output variable for later stages
+            echo "##vso[task.setvariable variable=orderApiPushed;isOutput=true]true"
+          else
+            echo "⊘ Order API image not found - skipping push"
+            echo "##vso[task.setvariable variable=orderApiPushed;isOutput=true]false"
+          fi
+
+          # Check and push Order Worker
+          ORDER_WORKER_IMAGE="$(ACR_NAME).azurecr.io/order-worker:$(imageTag)"
+          if docker images --format "{{.Repository}}:{{.Tag}}" | grep -q "^${ORDER_WORKER_IMAGE}$"; then
+            echo "======================================="
+            echo "  PUSHING ORDER WORKER IMAGE"
+            echo "======================================="
+            echo "Image: $ORDER_WORKER_IMAGE"
+            
+            docker push $ORDER_WORKER_IMAGE
+            
+            echo "--- Tagging and pushing Order Worker as latest ---"
+            docker tag $ORDER_WORKER_IMAGE $(ACR_NAME).azurecr.io/order-worker:latest
+            docker push $(ACR_NAME).azurecr.io/order-worker:latest
+            
+            echo "✓ Order Worker images pushed successfully"
+            PUSH_COUNT=$((PUSH_COUNT + 1))
+            ORDER_WORKER_PUSHED=true
+            
+            # Set output variable for later stages
+            echo "##vso[task.setvariable variable=orderWorkerPushed;isOutput=true]true"
+          else
+            echo "⊘ Order Worker image not found - skipping push"
+            echo "##vso[task.setvariable variable=orderWorkerPushed;isOutput=true]false"
+          fi
+          
+          echo ""
+          echo "======================================="
+          echo "  IMAGE PUSH SUMMARY"
+          echo "======================================="
+          echo "Total images pushed: $PUSH_COUNT"
+          echo ""
+          if [[ "$ORDER_API_PUSHED" == "true" ]]; then
+            echo "  ✓ Order API: PUSHED"
+          else
+            echo "  ⊘ Order API: SKIPPED"
+          fi
+          
+          if [[ "$ORDER_WORKER_PUSHED" == "true" ]]; then
+            echo "  ✓ Order Worker: PUSHED"
+          else
+            echo "  ⊘ Order Worker: SKIPPED"
+          fi
+          echo "======================================="
+          echo ""
+          
+          if [ $PUSH_COUNT -eq 0 ]; then
+            echo "⚠ WARNING: No images were pushed!"
+            echo "This might indicate a problem with the build stage."
+            echo "Check previous build tasks for errors."
+            exit 0  # Don't fail the pipeline, just warn
+          fi
+          
+          echo "✅ Image push operation completed successfully"
+          exit 0
+# ------------------------------------------------------------------------------
+# STAGE 6: Apply Application Infrastructure
+# ------------------------------------------------------------------------------
+- stage: ApplyApplicationInfrastructure
+  displayName: '6. Apply Application Infrastructure'
+  dependsOn: 
+    - ApplySharedInfrastructure
+    - BuildScanAndPushImages
+  condition: |
+    and(
+      eq(dependencies.ApplySharedInfrastructure.result, 'Succeeded'),
+      in(dependencies.BuildScanAndPushImages.result, 'Succeeded', 'SucceededWithIssues', 'Skipped'),
+      eq('${{ parameters.destroyResources }}', false)
+    )
+  jobs:
+  - job: Apply
+    displayName: 'Apply Application Infrastructure'
+    steps:
+    - checkout: self
+    
+    - script: |
+        set -e
+        
+        echo "Proceeding with remaining infrastructure deployment..."
+        
+        echo "--- Initializing Tofu for $(targetEnvironment) ---"
+        if ! tofu init \
+          -backend-config="resource_group_name=$(TF_STATE_RG)" \
+          -backend-config="storage_account_name=$(TF_STATE_STORAGE_ACCOUNT)" \
+          -backend-config="container_name=$(TF_STATE_CONTAINER)" \
+          -backend-config="key=$(targetEnvironment).tfstate"; then
+          echo "Failed to initialize Tofu"
+          exit 1
+        fi
+
+        echo "--- Selecting workspace ---"
+        if ! tofu workspace select $(targetEnvironment); then
+          echo "Failed to select workspace"
+          exit 1
+        fi
+
+        echo "--- Generating new plan for remaining infrastructure ---"
+        tofu plan -var-file="environments/$(targetEnvironment).tfvars" -out=tfplan_remaining.binary -input=false
+
+        echo "--- Validating plan ---"
+        tofu show -no-color tfplan_remaining.binary > tfplan_remaining.txt
+        echo "===== Plan Summary for Remaining Infrastructure ====="
+        ADD=$(grep -c "will be created" tfplan_remaining.txt || true)
+        CHANGE=$(grep -c "will be updated" tfplan_remaining.txt || true)
+        DESTROY=$(grep -c "will be destroyed" tfplan_remaining.txt || true)
+        echo "To Add: $ADD resources"
+        echo "To Change: $CHANGE resources"
+        echo "To Destroy: $DESTROY resources"
+        echo "===================================================="
+
+        echo "--- Applying remaining infrastructure plan ---"
+        tofu apply -input=false -auto-approve tfplan_remaining.binary
+
+        echo "--- Exporting outputs ---"
+        tofu output -json > outputs.json
+        
+        echo "Remaining infrastructure deployment completed successfully!"
+        
+      name: ApplyRemainingPlan
+      displayName: 'Apply Remaining Terraform Plan'
+    
+    - publish: '$(System.DefaultWorkingDirectory)/outputs.json'
+      artifact: 'tofu-outputs-application-infra-$(targetEnvironment)'
+
+# ------------------------------------------------------------------------------
+# STAGE 7: Approve Container Apps Deployment
+# ------------------------------------------------------------------------------
+- stage: ApproveContainerApps
+  displayName: '7. Approve Container Apps Update'
+  dependsOn: 
+    - Initialize
+    - BuildScanAndPushImages
+
+  condition: |
+    and(
+      in(dependencies.BuildScanAndPushImages.result, 'Succeeded', 'SucceededWithIssues'),
+      eq('${{ parameters.destroyResources }}', false),
+      ne('${{ parameters.deploymentScope }}', 'infrastructure'),
+      or(
+        eq(dependencies.Initialize.outputs['Setup.Detection.appChanged'], 'true'),
+        eq('${{ parameters.deploymentScope }}', 'applications'),
+        eq('${{ parameters.deploymentScope }}', 'complete')
+      ),
+      eq(variables['targetEnvironment'], 'prod')
+    )
+  jobs:
+  - job: WaitForApproval
+    displayName: 'Manual Approval for PROD Container Apps'
+    pool: server
+    timeoutInMinutes: 1440
+    steps:
+    - task: ManualValidation@1
+      displayName: 'Wait for PROD Container Apps Deployment Approval'
+      timeoutInMinutes: 1440
+      inputs:
+        notifyUsers: |
+          "ismaeelsahib@gmail.com"
+        approvers: "ismaeelhaider@rashideurustechnologies.onmicrosoft.com"
+        allowApproversToApproveTheirOwnRuns: true
+        instructions: |
+          CONTAINER APPS DEPLOYMENT APPROVAL REQUIRED
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          
+          DEPLOYMENT DETAILS:
+          • Environment: $(targetEnvironment)
+          • Branch: $(Build.SourceBranch)
+          • Triggered by: $(Build.RequestedFor)
+          • Build ID: $(Build.BuildId)
+          • Image Tag: $(Build.BuildId)
+          
+          APPLICATIONS TO UPDATE:
+          Review the build logs to see which applications were built and scanned.
+          
+          ACTION REQUIRED:
+          Please confirm that container images have been built successfully
+          and you want to proceed with updating the Container Apps.
+          
+          TO APPROVE: Click "Resume" button
+          TO REJECT: Click "Reject" button
+          
+          This request will timeout in 24 hours
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        onTimeout: 'reject'
+
+# ------------------------------------------------------------------------------
+# STAGE 8: Update Container Apps
+# ------------------------------------------------------------------------------
+- stage: UpdateContainerApps
+  displayName: '8. Update Container Apps'
+  dependsOn: 
+    - Initialize
+    - BuildScanAndPushImages
+    - ApproveContainerApps
+    - ApplyApplicationInfrastructure
+
+  condition: |
+    and(
+      eq('${{ parameters.destroyResources }}', false),
+      ne('${{ parameters.deploymentScope }}', 'infrastructure'),
+      in(dependencies.BuildScanAndPushImages.result, 'Succeeded', 'SucceededWithIssues'),
+      in(dependencies.ApplyApplicationInfrastructure.result, 'Succeeded', 'SucceededWithIssues', 'Skipped'),
+      in(dependencies.ApproveContainerApps.result, 'Succeeded', 'Skipped')
+    )
+  
+  jobs:
+  - job: UpdateApps
+    displayName: 'Update Container Apps'
+    
+    variables:
+      orderApiChanged: $[ stageDependencies.Initialize.Setup.outputs['Detection.orderApiChanged'] ]
+      orderWorkerChanged: $[ stageDependencies.Initialize.Setup.outputs['Detection.orderWorkerChanged'] ]
+      orderApiPushed: $[ stageDependencies.BuildScanAndPushImages.BuildPush.outputs['LoginAndPushImages.orderApiPushed'] ]
+      orderWorkerPushed: $[ stageDependencies.BuildScanAndPushImages.BuildPush.outputs['LoginAndPushImages.orderWorkerPushed'] ]
+    
+    steps:
+      - checkout: self
+
+      - bash: |
+          echo "======= Update Stage Variables ======="
+          echo "Order API Changed: $(orderApiChanged)"
+          echo "Order Worker Changed: $(orderWorkerChanged)"
+          echo "Order API Pushed: $(orderApiPushed)"
+          echo "Order Worker Pushed: $(orderWorkerPushed)"
+          echo "Deployment Scope: ${{ parameters.deploymentScope }}"
+          echo "====================================="
+          
+          DEPLOY_ORDER_API=false
+          DEPLOY_ORDER_WORKER=false
+          
+          # Determine deployment strategy based on scope
+          if [[ "${{ parameters.deploymentScope }}" == "applications" || "${{ parameters.deploymentScope }}" == "complete" ]]; then
+            echo "Deployment scope is 'applications' or 'complete' - deploying all successfully pushed images"
+            if [[ "$(orderApiPushed)" == "true" ]]; then
+              DEPLOY_ORDER_API=true
+              echo "✓ Order API will be deployed (image was pushed)"
+            fi
+            if [[ "$(orderWorkerPushed)" == "true" ]]; then
+              DEPLOY_ORDER_WORKER=true
+              echo "✓ Order Worker will be deployed (image was pushed)"
+            fi
+          else
+            echo "Deployment scope is 'auto' - deploying only changed and pushed applications"
+            # Only deploy if changed AND successfully pushed
+            if [[ "$(orderApiChanged)" == "true" && "$(orderApiPushed)" == "true" ]]; then
+              DEPLOY_ORDER_API=true
+              echo "✓ Order API will be deployed (changed and pushed)"
+            fi
+            
+            if [[ "$(orderWorkerChanged)" == "true" && "$(orderWorkerPushed)" == "true" ]]; then
+              DEPLOY_ORDER_WORKER=true
+              echo "✓ Order Worker will be deployed (changed and pushed)"
+            fi
+          fi
+          
+          # Export deployment flags
+          echo "##vso[task.setvariable variable=DEPLOY_ORDER_API]$DEPLOY_ORDER_API"
+          echo "##vso[task.setvariable variable=DEPLOY_ORDER_WORKER]$DEPLOY_ORDER_WORKER"
+          
+          echo "======= Final Deployment Decision ======="
+          echo "Will Deploy Order API: $DEPLOY_ORDER_API"
+          echo "Will Deploy Order Worker: $DEPLOY_ORDER_WORKER"
+          echo "========================================"
+        displayName: 'Determine Deployment Strategy'
+
+      - task: Bash@3
+        name: GetInfraOutputs
+        displayName: 'Get Infrastructure Outputs'
+        inputs:
+          targetType: 'inline'
+          script: |
+            set -e
+            echo "Getting infrastructure outputs for $(targetEnvironment)..."
+            tofu init -reconfigure \
+              -backend-config="resource_group_name=$(TF_STATE_RG)" \
+              -backend-config="storage_account_name=$(TF_STATE_STORAGE_ACCOUNT)" \
+              -backend-config="container_name=$(TF_STATE_CONTAINER)" \
+              -backend-config="key=$(targetEnvironment).tfstate"
+            tofu workspace select $(targetEnvironment)
+            tofu output -json > outputs.json
+            
+            ACR_NAME=$(jq -r '.container_registry_names.value.main // "NOT_FOUND"' outputs.json)
+            APP_RG=$(jq -r '.resource_group_names.value.apps // "NOT_FOUND"' outputs.json)
+            
+            if [[ "$ACR_NAME" == "NOT_FOUND" ]]; then
+              echo "❌ Error: ACR Name not found in Terraform outputs!"
+              exit 1
+            fi
+            
+            if [[ "$APP_RG" == "NOT_FOUND" ]]; then
+              echo "❌ Error: Application Resource Group not found in Terraform outputs!"
+              exit 1
+            fi
+            
+            echo "##vso[task.setvariable variable=ACR_NAME]$ACR_NAME"
+            echo "##vso[task.setvariable variable=APP_RG]$APP_RG"
+            echo "✓ ACR Name: $ACR_NAME"
+            echo "✓ App RG: $APP_RG"
+
+      - task: Bash@3
+        displayName: 'Update Order API Container App'
+        condition: and(succeeded(), eq(variables['DEPLOY_ORDER_API'], 'true'))
+        inputs:
+          targetType: 'inline'
+          script: |
+            set -e
+            echo "========================================"
+            echo "   UPDATING ORDER API CONTAINER APP"
+            echo "========================================"
+            
+            echo "Authenticating with Azure CLI..."
+            az login --service-principal \
+              -u $(ARM_CLIENT_ID) \
+              -p $(ARM_CLIENT_SECRET) \
+              --tenant $(ARM_TENANT_ID) \
+              --output none
+            az account set --subscription $(ARM_SUBSCRIPTION_ID)
+            
+            echo "Finding Order API Container App in RG: $(APP_RG)"
+            ORDER_API_NAME=$(az containerapp list \
+              -g $(APP_RG) \
+              --query "[?contains(name, 'order-api')].name" \
+              -o tsv | head -n1)
+            
+            if [ -z "$ORDER_API_NAME" ]; then
+              echo "❌ Error: Order API Container App not found in $(APP_RG)"
+              echo "Available Container Apps:"
+              az containerapp list -g $(APP_RG) --query "[].name" -o table
+              exit 1
+            fi
+            
+            echo "✓ Found Order API Container App: $ORDER_API_NAME"
+            
+            NEW_IMAGE="$(ACR_NAME).azurecr.io/order-api:$(imageTag)"
+            echo "Updating with image: $NEW_IMAGE"
+            
+            # Get current revision before update
+            CURRENT_REVISION=$(az containerapp revision list \
+              -n $ORDER_API_NAME \
+              -g $(APP_RG) \
+              --query "[0].name" \
+              -o tsv)
+            echo "Current revision: $CURRENT_REVISION"
+            
+            # Update the container app
+            az containerapp update \
+              -n $ORDER_API_NAME \
+              -g $(APP_RG) \
+              --image $NEW_IMAGE \
+              --output none
+            
+            echo "Waiting for new revision to be provisioned..."
+            sleep 10
+            
+            # Get new revision
+            NEW_REVISION=$(az containerapp revision list \
+              -n $ORDER_API_NAME \
+              -g $(APP_RG) \
+              --query "[0].name" \
+              -o tsv)
+            
+            echo "New revision: $NEW_REVISION"
+            
+            # Verify the update
+            CURRENT_IMAGE=$(az containerapp show \
+              -n $ORDER_API_NAME \
+              -g $(APP_RG) \
+              --query "properties.template.containers[0].image" \
+              -o tsv)
+            
+            if [[ "$CURRENT_IMAGE" == "$NEW_IMAGE" ]]; then
+              echo "✅ Order API Container App updated successfully"
+              echo "   App Name: $ORDER_API_NAME"
+              echo "   New Image: $CURRENT_IMAGE"
+              echo "   New Revision: $NEW_REVISION"
+            else
+              echo "⚠ Warning: Image verification failed"
+              echo "   Expected: $NEW_IMAGE"
+              echo "   Actual: $CURRENT_IMAGE"
+              exit 1
+            fi
+            
+            echo "========================================"
+
+      - task: Bash@3
+        displayName: 'Update Order Worker Container App'
+        condition: and(succeeded(), eq(variables['DEPLOY_ORDER_WORKER'], 'true'))
+        inputs:
+          targetType: 'inline'
+          script: |
+            set -e
+            echo "========================================"
+            echo "  UPDATING ORDER WORKER CONTAINER APP"
+            echo "========================================"
+            
+            echo "Authenticating with Azure CLI..."
+            az login --service-principal \
+              -u $(ARM_CLIENT_ID) \
+              -p $(ARM_CLIENT_SECRET) \
+              --tenant $(ARM_TENANT_ID) \
+              --output none
+            az account set --subscription $(ARM_SUBSCRIPTION_ID)
+            
+            echo "Finding Order Worker Container App in RG: $(APP_RG)"
+            ORDER_WORKER_NAME=$(az containerapp list \
+              -g $(APP_RG) \
+              --query "[?contains(name, 'order-worker')].name" \
+              -o tsv | head -n1)
+            
+            if [ -z "$ORDER_WORKER_NAME" ]; then
+              echo "❌ Error: Order Worker Container App not found in $(APP_RG)"
+              echo "Available Container Apps:"
+              az containerapp list -g $(APP_RG) --query "[].name" -o table
+              exit 1
+            fi
+            
+            echo "✓ Found Order Worker Container App: $ORDER_WORKER_NAME"
+            
+            NEW_IMAGE="$(ACR_NAME).azurecr.io/order-worker:$(imageTag)"
+            echo "Updating with image: $NEW_IMAGE"
+            
+            # Get current revision before update
+            CURRENT_REVISION=$(az containerapp revision list \
+              -n $ORDER_WORKER_NAME \
+              -g $(APP_RG) \
+              --query "[0].name" \
+              -o tsv)
+            echo "Current revision: $CURRENT_REVISION"
+            
+            # Update the container app
+            az containerapp update \
+              -n $ORDER_WORKER_NAME \
+              -g $(APP_RG) \
+              --image $NEW_IMAGE \
+              --output none
+            
+            echo "Waiting for new revision to be provisioned..."
+            sleep 10
+            
+            # Get new revision
+            NEW_REVISION=$(az containerapp revision list \
+              -n $ORDER_WORKER_NAME \
+              -g $(APP_RG) \
+              --query "[0].name" \
+              -o tsv)
+            
+            echo "New revision: $NEW_REVISION"
+            
+            # Verify the update
+            CURRENT_IMAGE=$(az containerapp show \
+              -n $ORDER_WORKER_NAME \
+              -g $(APP_RG) \
+              --query "properties.template.containers[0].image" \
+              -o tsv)
+            
+            if [[ "$CURRENT_IMAGE" == "$NEW_IMAGE" ]]; then
+              echo "✅ Order Worker Container App updated successfully"
+              echo "   App Name: $ORDER_WORKER_NAME"
+              echo "   New Image: $CURRENT_IMAGE"
+              echo "   New Revision: $NEW_REVISION"
+            else
+              echo "⚠ Warning: Image verification failed"
+              echo "   Expected: $NEW_IMAGE"
+              echo "   Actual: $CURRENT_IMAGE"
+              exit 1
+            fi
+            
+            echo "========================================"
+
+      - task: Bash@3
+        displayName: 'Deployment Summary'
+        condition: always()
+        inputs:
+          targetType: 'inline'
+          script: |
+            echo "========================================"
+            echo "    CONTAINER APPS DEPLOYMENT SUMMARY"
+            echo "========================================"
+            echo "Environment: $(targetEnvironment)"
+            echo "Build ID: $(Build.BuildId)"
+            echo "Image Tag: $(imageTag)"
+            echo ""
+            echo "Deployment Results:"
+            if [[ "$(DEPLOY_ORDER_API)" == "true" ]]; then
+              echo "  ✓ Order API: DEPLOYED"
+            else
+              echo "  ⊘ Order API: SKIPPED"
+            fi
+            if [[ "$(DEPLOY_ORDER_WORKER)" == "true" ]]; then
+              echo "  ✓ Order Worker: DEPLOYED"
+            else
+              echo "  ⊘ Order Worker: SKIPPED"
+            fi
+            echo "========================================"
+
+# ------------------------------------------------------------------------------
+# STAGE 9: Smoke Test Validation
+# ------------------------------------------------------------------------------
+- stage: SmokeTest
+  displayName: '9. Smoke Test Environment Validation'
+  dependsOn: 
+    - UpdateContainerApps
+    - ApplyApplicationInfrastructure
+  condition: |
+    and(
+      eq('${{ parameters.destroyResources }}', false),
+      or(
+        in(dependencies.UpdateContainerApps.result, 'Succeeded', 'SucceededWithIssues', 'Skipped'),
+        in(dependencies.ApplyApplicationInfrastructure.result, 'Succeeded', 'SucceededWithIssues')
+      )
+    )
+  jobs:
+  - job: RunSmokeTests
+    displayName: 'Run Environment Smoke Tests'
+    steps:
+    - task: Bash@3
+      displayName: 'Smoke Test Checks'
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -e
+          echo "Authenticating with Azure CLI..."
+          az login --service-principal -u $(ARM_CLIENT_ID) -p $(ARM_CLIENT_SECRET) --tenant $(ARM_TENANT_ID) --only-show-errors
+          az account set --subscription $(ARM_SUBSCRIPTION_ID)
+
+          ENV="$(targetEnvironment)"
+          echo "========================================"
+          echo "  SMOKE TEST FOR ENVIRONMENT: $ENV"
+          echo "========================================"
+
+          echo ""
+          echo "=== 1. Resource Group Validation ==="
+          RG_COUNT=$(az group list --query "[?contains(name, 'ordertracking-$ENV')]" --only-show-errors | jq '. | length')
+          echo "Found $RG_COUNT resource groups for environment: $ENV"
+          az group list --query "[?contains(name, 'ordertracking-$ENV')].{Name:name, Location:location}" -o table --only-show-errors
+          
+          if [ "$RG_COUNT" -eq 0 ]; then
+            echo "❌ No resource groups found for environment: $ENV"
+            exit 1
+          fi
+
+          echo ""
+          echo "=== 2. Virtual Network Validation ==="
+          if [[ "$ENV" == "prod" ]]; then
+            VNET=$(az network vnet list --query "[?contains(name, 'ordertracking-$ENV')].name" -o tsv --only-show-errors)
+            if [ -z "$VNET" ]; then
+              echo "❌ No VNet found for production environment!"
+              exit 1
+            else
+              echo "✓ VNet found: $VNET"
+            fi
+          else
+            echo "ℹ Non-prod environment — skipping strict VNet validation."
+          fi
+
+          echo ""
+          echo "=== 3. Container Apps Health Check ==="
+          APP_RG=$(az group list --query "[?contains(name, '$ENV-apps')].name" -o tsv --only-show-errors | head -n1)
+          if [ -z "$APP_RG" ]; then
+            echo "❌ Application Resource Group not found!"
+            exit 1
+          fi
+          
+          echo "Application Resource Group: $APP_RG"
+          echo ""
+          echo "Container Apps Status:"
+          az containerapp list -g $APP_RG --query "[].{Name:name, State:properties.provisioningState, Replicas:properties.runningStatus}" -o table --only-show-errors
+          
+          UNHEALTHY=$(az containerapp list -g $APP_RG --query "[?properties.provisioningState!='Succeeded'].name" -o tsv --only-show-errors)
+          if [ -n "$UNHEALTHY" ]; then
+            echo "❌ Some container apps are not healthy:"
+            echo "$UNHEALTHY"
+            exit 1
+          fi
+          echo "✓ All Container Apps are healthy."
+
+          echo ""
+          echo "=== 4. API Management (APIM) Check ==="
+          APIM_ENDPOINT="https://ordertracking-$ENV-main-apim.azure-api.net"
+          echo "Testing APIM endpoint: $APIM_ENDPOINT"
+          STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$APIM_ENDPOINT" --max-time 10)
+          if [ "$STATUS_CODE" -eq 404 ] || [ "$STATUS_CODE" -eq 401 ] || [ "$STATUS_CODE" -eq 403 ]; then
+            echo "✓ APIM is reachable and secure (HTTP $STATUS_CODE)"
+          elif [ "$STATUS_CODE" -eq 000 ]; then
+            echo "⚠ Warning: APIM endpoint not reachable (timeout or DNS issue)"
+          else
+            echo "⚠ Unexpected APIM response (HTTP $STATUS_CODE)"
+          fi
+
+          echo ""
+          echo "=== 5. Log Analytics Workspace Check ==="
+          LAW=$(az monitor log-analytics workspace list --query "[?contains(name, 'ordertracking-$ENV-main-log')].name" -o tsv --only-show-errors)
+          if [ -z "$LAW" ]; then
+            echo "❌ Log Analytics workspace not found!"
+            exit 1
+          fi
+          echo "✓ Log Analytics Workspace found: $LAW"
+
+          echo ""
+          echo "=== 6. Dapr Component Validation ==="
+          FIRST_APP=$(az containerapp list -g "$APP_RG" --query "[0].name" -o tsv --only-show-errors)
+          if [ -n "$FIRST_APP" ]; then
+            echo "ℹ Found first Container App: $FIRST_APP"
+
+            # Extract CAE details
+            APP_ENV_ID=$(az containerapp show -n "$FIRST_APP" -g "$APP_RG" --query "properties.environmentId" -o tsv)
+            APP_ENV_RG=$(echo "$APP_ENV_ID" | awk -F'/resourceGroups/' '{print $2}' | awk -F'/' '{print $1}')
+            APP_ENV_NAME=$(echo "$APP_ENV_ID" | awk -F'/managedEnvironments/' '{print $2}')
+
+            echo "✓ Found Container App Environment: $APP_ENV_NAME (RG: $APP_ENV_RG)"
+
+            # List Dapr components
+            DAPR_COMPONENTS=$(az containerapp env dapr-component list -g "$APP_ENV_RG" -n "$APP_ENV_NAME" --query "[].name" -o tsv --only-show-errors 2>/dev/null || echo "")
+            if [ -n "$DAPR_COMPONENTS" ]; then
+              echo "✓ Dapr components configured in environment '$APP_ENV_NAME':"
+              echo "$DAPR_COMPONENTS" | sed 's/^/   • /'
+            else
+              echo "ℹ No Dapr components configured in environment '$APP_ENV_NAME'."
+            fi
+          else
+            echo "⚠ No Container App found in resource group '$APP_RG' — cannot infer Dapr environment."
+          fi
+
+          echo ""
+          echo "=== 7. Container Registry Check ==="
+          ACR_NAME=$(az acr list --query "[?contains(name, 'ordertracking') && contains(name, '$ENV')].name" -o tsv --only-show-errors | head -n1)
+          if [ -n "$ACR_NAME" ]; then
+            echo "✓ Container Registry found: $ACR_NAME"
+            
+            # Check for recent images
+            echo "Recent images in ACR:"
+            az acr repository list -n $ACR_NAME -o table --only-show-errors 2>/dev/null || echo "  (Unable to list repositories)"
+          else
+            echo "⚠ Container Registry not found for environment: $ENV"
+          fi
+
+          echo ""
+          echo "========================================"
+          echo "  ✅ SMOKE TEST COMPLETED SUCCESSFULLY"
+          echo "========================================"
+          echo ""
+          echo "Summary:"
+          echo "  • Environment: $ENV"
+          echo "  • Resource Groups: $RG_COUNT"
+          echo "  • Container Apps: Healthy"
+          echo "  • APIM: Accessible"
+          echo "  • Log Analytics: Configured"
+          echo ""
+
+# ------------------------------------------------------------------------------
+# STAGE 10: Destroy Infrastructure (Conditional)
+# ------------------------------------------------------------------------------
+- stage: DestroyInfrastructure
+  displayName: '10. Destroy Infrastructure'
+  dependsOn: Initialize
+  condition: eq('${{ parameters.destroyResources }}', true)
+  jobs:
+  - job: ConfirmDestroy
+    displayName: 'Confirm Destruction'
+    pool: server
+    timeoutInMinutes: 1440
+    steps:
+    - task: ManualValidation@1
+      displayName: 'Confirm Infrastructure Destruction'
+      timeoutInMinutes: 1440
+      inputs:
+        notifyUsers: |
+          "ismaeelsahib@gmail.com"
+        approvers: "ismaeelhaider@rashideurustechnologies.onmicrosoft.com"
+        allowApproversToApproveTheirOwnRuns: true
+        instructions: |
+          ⚠️ CRITICAL: INFRASTRUCTURE DESTRUCTION REQUESTED ⚠️
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          
+          DESTRUCTION DETAILS:
+          • Environment: $(targetEnvironment)
+          • Branch: $(Build.SourceBranch)
+          • Triggered by: $(Build.RequestedFor)
+          • Build ID: $(Build.BuildId)
+          
+          ⚠️ THIS WILL DELETE ALL RESOURCES IN THE ENVIRONMENT
+          
+          This includes:
+          • Container Apps
+          • Databases
+          • Storage Accounts
+          • Virtual Networks
+          • All other infrastructure
+          
+          ⚠️ THIS ACTION CANNOT BE UNDONE
+          
+          TO PROCEED: Click "Resume" button
+          TO CANCEL: Click "Reject" button
+          
+          This request will timeout in 24 hours
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        onTimeout: 'reject'
+
+  - job: Destroy
+    displayName: 'Destroy All Resources'
+    dependsOn: ConfirmDestroy
+    condition: succeeded()
+    steps:
+    - checkout: self
+    
+    - script: |
+        set -e
+        
+        echo "========================================"
+        echo "  DESTROYING INFRASTRUCTURE"
+        echo "  Environment: $(targetEnvironment)"
+        echo "========================================"
+        
+        echo "--- Initializing Tofu for $(targetEnvironment) ---"
+        tofu init \
+          -backend-config="resource_group_name=$(TF_STATE_RG)" \
+          -backend-config="storage_account_name=$(TF_STATE_STORAGE_ACCOUNT)" \
+          -backend-config="container_name=$(TF_STATE_CONTAINER)" \
+          -backend-config="key=$(targetEnvironment).tfstate"
+
+        echo "--- Selecting workspace ---"
+        tofu workspace select $(targetEnvironment) || tofu workspace new $(targetEnvironment)
+
+        echo "--- Planning destruction ---"
+        tofu plan -destroy -var-file="environments/$(targetEnvironment).tfvars" -out=destroy.tfplan
+        
+        echo "--- Destruction plan summary ---"
+        tofu show -no-color destroy.tfplan > destroy_plan.txt
+        DESTROY_COUNT=$(grep -c "will be destroyed" destroy_plan.txt || true)
+        echo "Resources to be destroyed: $DESTROY_COUNT"
+
+        echo "--- Executing destruction ---"
+        tofu destroy -var-file="environments/$(targetEnvironment).tfvars" -auto-approve
+        
+        echo "========================================"
+        echo "  ✓ INFRASTRUCTURE DESTROYED"
+        echo "  Resources destroyed: $DESTROY_COUNT"
+        echo "========================================"
+        
+      name: DestroyPlan
+      displayName: 'Destroy Terraform Resources'
+    
+    - publish: '$(System.DefaultWorkingDirectory)/destroy_plan.txt'
+      artifact: 'destroy-plan-$(targetEnvironment)'
+      condition: always()

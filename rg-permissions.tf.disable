@@ -1,0 +1,49 @@
+# Data sources for existing resource groups
+data "azurerm_resource_group" "infra" {
+  name = "${var.org_prefix}-${var.environment}-infra-rg"
+}
+
+data "azurerm_resource_group" "apps" {
+  name = "${var.org_prefix}-${var.environment}-apps-rg"
+}
+
+# Get the Service Principal Object ID
+data "azuread_service_principal" "terraform_sp" {
+  client_id = var.terraform_sp_client_id
+}
+
+# ==============================================================================
+# INFRA RESOURCE GROUP PERMISSIONS
+# ==============================================================================
+
+# User Access Administrator on Infra RG
+resource "azurerm_role_assignment" "sp_infra_user_access_admin" {
+  scope                = data.azurerm_resource_group.infra.id
+  role_definition_name = "User Access Administrator"
+  principal_id         = data.azuread_service_principal.terraform_sp.object_id
+}
+
+# Contributor on Infra RG
+resource "azurerm_role_assignment" "sp_infra_contributor" {
+  scope                = data.azurerm_resource_group.infra.id
+  role_definition_name = "Contributor"
+  principal_id         = data.azuread_service_principal.terraform_sp.object_id
+}
+
+# ==============================================================================
+# APPS RESOURCE GROUP PERMISSIONS
+# ==============================================================================
+
+# User Access Administrator on Apps RG
+resource "azurerm_role_assignment" "sp_apps_user_access_admin" {
+  scope                = data.azurerm_resource_group.apps.id
+  role_definition_name = "User Access Administrator"
+  principal_id         = data.azuread_service_principal.terraform_sp.object_id
+}
+
+# Contributor on Apps RG
+resource "azurerm_role_assignment" "sp_apps_contributor" {
+  scope                = data.azurerm_resource_group.apps.id
+  role_definition_name = "Contributor"
+  principal_id         = data.azuread_service_principal.terraform_sp.object_id
+}
