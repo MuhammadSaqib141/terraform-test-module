@@ -2,7 +2,8 @@ name: Scheduled Workflow
 
 on:
   schedule:
-    - cron: '* * * * *' # Runs every 1 minute
+    - cron: '* * * * *'   # Runs every 1 minute (optional)
+  workflow_dispatch:       # Allows manual run
 
 jobs:
   build:
@@ -12,4 +13,4 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Run a script
-        run: echo "This job runs on a schedule!"
+        run: echo "This job runs on a schedule or manually!"
